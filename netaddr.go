@@ -29,50 +29,40 @@ const (
 	maxUint16 = 1<<16 - 1
 )
 
+// o4 is the offset to the beginning of the IPv4 address within IP.a.
+const o4 = 12
+
 // Sizes: (64-bit)
 //   net.IP:     24 byte slice header + {4, 16} = 28 to 40 bytes
 //   net.IPAddr: 40 byte slice header + {4, 16} = 44 to 56 bytes + zone length
-//   netaddr.IP: 16 byte interface + {4, 16, 24} = 20, 32, 40 bytes + zone length
+//   netaddr.IP: 24 bytes, always (zone, if any, is cached globally forever)
 
 // IP represents an IPv4 or IPv6 address (with or without a scoped
 // addressing zone), similar to Go's net.IP or net.IPAddr.
 //
 // Unlike net.IP or net.IPAddr, the netaddr.IP is a comparable value
 // type (it supports == and can be a map key) and is immutable.
-// Its memory representation ranges from 20 to 40 bytes, depending on
-// whether the underlying adddress is IPv4, IPv6, or IPv6 with a
-// zone. (This is smaller than the standard library's 28 to 56 bytes)
+// Its memory representation is 24 bytes in 64-bit machines (the same
+// size as a Go slice header) for both IPv4 and IPv6 address.
 type IP struct {
-	ipImpl
+	a  [16]byte // IPv6 or IPv4-mapped IPv6 form of IPv4 addr
+	zt ztype    // 0=invalid, 1=IPv4, 2=zoneless IPv6, 3+ for IPv6 w/ zone from table
 }
 
-// ipImpl is the interface representing either a v4addr, v6addr, v6ZoneAddr.
-type ipImpl interface {
-	is4() bool
-	is6() bool
-	is4in6() bool
-	as16() ip16
-	// prefix is the type-specific implementation of IP.Prefix.
-	prefix(uint8) (IPPrefix, error)
-	String() string
-}
+// ztype is the zone index or type.
+type ztype uint64
 
-type v4Addr [4]byte
+const (
+	z0    = ztype(0)
+	z4    = ztype(1)
+	z6noz = ztype(2) // no zone
+)
 
-func (v4Addr) is4() bool    { return true }
-func (v4Addr) is6() bool    { return false }
-func (v4Addr) is4in6() bool { return false }
-func (ip v4Addr) as16() ip16 {
-	return ip16{
-		10: 0xff,
-		11: 0xff,
-		12: ip[0],
-		13: ip[1],
-		14: ip[2],
-		15: ip[3],
-	}
-}
-func (ip v4Addr) prefix(bits uint8) (IPPrefix, error) {
+func (z ztype) IsZero() bool { return z == z0 }
+func (z ztype) Is4() bool    { return z == z4 }
+func (z ztype) Is6() bool    { return z > z4 }
+
+func v4Prefix(ip [4]byte, bits uint8) (IPPrefix, error) {
 	if bits > 32 {
 		return IPPrefix{}, fmt.Errorf("netaddr: prefix length %d too large for IP address family", bits)
 	}
@@ -84,9 +74,8 @@ func (ip v4Addr) prefix(bits uint8) (IPPrefix, error) {
 	for i := skip; i < 4; i++ {
 		ip[i] = 0
 	}
-	return IPPrefix{IP{ip}, bits}, nil
+	return IPPrefix{IPv4(ip[0], ip[1], ip[2], ip[3]), bits}, nil
 }
-func (ip v4Addr) String() string { return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]) }
 
 const (
 	// mapped4Prefix are the 12 leading bytes in a IPv4-mapped IPv6 address.
@@ -96,13 +85,7 @@ const (
 	v6Loopback = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
 )
 
-type v6Addr [16]byte
-
-func (v6Addr) is4() bool       { return false }
-func (v6Addr) is6() bool       { return true }
-func (ip v6Addr) is4in6() bool { return string(ip[:len(mapped4Prefix)]) == mapped4Prefix }
-func (ip v6Addr) as16() ip16   { return ip16(ip) }
-func (ip v6Addr) prefix(bits uint8) (IPPrefix, error) {
+func v6Prefix(ip [16]byte, bits uint8) (IPPrefix, error) {
 	if bits > 128 {
 		return IPPrefix{}, fmt.Errorf("netaddr: prefix length %d too large for IP address family", bits)
 	}
@@ -115,26 +98,11 @@ func (ip v6Addr) prefix(bits uint8) (IPPrefix, error) {
 	for i := range b {
 		b[i] = 0
 	}
-	return IPPrefix{IP{ip}, bits}, nil
-}
-func (ip v6Addr) String() string {
-	// TODO: better implementation; don't jump through these hoops
-	// and pay these allocs just to share a bit of code with
-	// std. Just copy & modify it as needed.
-	if ip.is4in6() {
-		mod := ip
-		mod[10] = 0xfe // change to arbitrary byte that's not 0xff to hide it from Go
-		s := net.IP(mod[:]).String()
-		return strings.Replace(s, "::feff:", "::ffff:", 1)
-	}
-	return (&net.IPAddr{IP: net.IP(ip[:])}).String()
+	return IPPrefix{IPv6Raw(ip), bits}, nil
 }
 
-type v6AddrZone struct {
-	v6Addr
-	zone string
-}
-
+/*
+xxx
 func (ip v6AddrZone) prefix(bits uint8) (IPPrefix, error) {
 	if bits > 128 {
 		return IPPrefix{}, fmt.Errorf("netaddr: prefix length %d too large for IP address family", bits)
@@ -150,37 +118,28 @@ func (ip v6AddrZone) prefix(bits uint8) (IPPrefix, error) {
 	}
 	return IPPrefix{IP{ip}, bits}, nil
 }
-func (ip v6AddrZone) String() string {
-	// TODO: better implementation
-	return (&net.IPAddr{IP: net.IP(ip.v6Addr[:]), Zone: ip.zone}).String()
-}
-
-// Well known IP addresses which are accessed only through exported functions,
-// so the linker can eliminate them if they are unused.
-var (
-	// ff02::1
-	ipv6LinkLocalAllNodes = IP{v6Addr{0: 0xff, 1: 0x02, 15: 0x01}}
-	// ::
-	ipv6Unspecified = IP{v6Addr{}}
-)
+*/
 
 // IPv6LinkLocalAllNodes returns the IPv6 link-local all nodes multicast
 // address ff02::1.
-func IPv6LinkLocalAllNodes() IP { return ipv6LinkLocalAllNodes }
+func IPv6LinkLocalAllNodes() IP { return IPv6Raw([16]byte{0: 0xff, 1: 0x02, 15: 0x01}) }
 
 // IPv6Unspecified returns the IPv6 unspecified address ::.
-func IPv6Unspecified() IP { return ipv6Unspecified }
+func IPv6Unspecified() IP { return IPv6Raw([16]byte{}) }
 
 // IPv4 returns the IP of the IPv4 address a.b.c.d.
 func IPv4(a, b, c, d uint8) IP {
-	return IP{v4Addr{a, b, c, d}}
+	return IP{
+		a:  [16]byte{10: 0xff, 11: 0xff, 12: a, 13: b, 14: c, 15: d},
+		zt: z4,
+	}
 }
 
 // IPv6Raw returns the IPv6 address given by the bytes in addr,
 // without an implicit Unmap call to unmap any v6-mapped IPv4
 // address.
 func IPv6Raw(addr [16]byte) IP {
-	return IP{v6Addr(addr)}
+	return IP{a: addr, zt: z6noz}
 }
 
 // IPFrom16 returns the IP address given by the bytes in addr,
@@ -190,9 +149,9 @@ func IPv6Raw(addr [16]byte) IP {
 // efficient.
 func IPFrom16(addr [16]byte) IP {
 	if string(addr[:len(mapped4Prefix)]) == mapped4Prefix {
-		return IPv4(addr[12], addr[13], addr[14], addr[15])
+		return IPv4(addr[o4+0], addr[o4+1], addr[o4+2], addr[o4+3])
 	}
-	return IP{v6Addr(addr)}
+	return IPv6Raw(addr)
 }
 
 // ParseIP parses s as an IP address, returning the result. The string
@@ -224,17 +183,12 @@ func ParseIP(s string) (IP, error) {
 
 	if !strings.Contains(s, ":") {
 		if ip4 := ipa.IP.To4(); ip4 != nil {
-			var v4 v4Addr
-			copy(v4[:], ip4)
-			return IP{v4}, nil
+			return IPv4(ip4[0], ip4[1], ip4[2], ip4[3]), nil
 		}
 	}
-	var v6 v6Addr
-	copy(v6[:], ipa.IP.To16())
-	if ipa.Zone != "" {
-		return IP{v6AddrZone{v6, ipa.Zone}}, nil
-	}
-	return IP{v6}, nil
+	var a16 [16]byte
+	copy(a16[:], ipa.IP.To16())
+	return IPv6Raw(a16).WithZone(ipa.Zone), nil
 }
 
 // FromStdIP returns an IP from the standard library's IP type.
@@ -253,13 +207,11 @@ func FromStdIP(std net.IP) (ip IP, ok bool) {
 	}
 	switch len(std) {
 	case 4:
-		var a v4Addr
-		copy(a[:], std)
-		return IP{a}, true
+		return IPv4(std[0], std[1], std[2], std[3]), true
 	case 16:
-		var a v6Addr
+		var a [16]byte
 		copy(a[:], std)
-		return IP{a}, true
+		return IPFrom16(a), true
 	}
 	return IP{}, false
 }
@@ -271,13 +223,11 @@ func FromStdIP(std net.IP) (ip IP, ok bool) {
 func FromStdIPRaw(std net.IP) (ip IP, ok bool) {
 	switch len(std) {
 	case 4:
-		var a v4Addr
-		copy(a[:], std)
-		return IP{a}, true
+		return IPv4(std[0], std[1], std[2], std[3]), true
 	case 16:
-		var a v6Addr
+		var a [16]byte
 		copy(a[:], std)
-		return IP{a}, true
+		return IPv6Raw(a), true
 	}
 	return IP{}, false
 }
@@ -293,21 +243,29 @@ func (ip IP) IsZero() bool { return ip == IP{} }
 // For the zero value (see IP.IsZero), it returns 0.
 // For IP4-mapped IPv6 addresses, it returns 128.
 func (ip IP) BitLen() uint8 {
-	if ip.IsZero() {
+	switch ip.zt {
+	case z0:
 		return 0
-	}
-	if ip.ipImpl.is4() {
+	case z4:
 		return 32
 	}
 	return 128
 }
 
+var (
+	zmu  sync.Mutex      // hold to add a new zone
+	zstr = new(sync.Map) // ztype to string
+	zint = new(sync.Map) // string to ztype
+)
+
 // Zone returns ip's IPv6 scoped addressing zone, if any.
 func (ip IP) Zone() string {
-	if v6z, ok := ip.ipImpl.(v6AddrZone); ok {
-		return v6z.zone
+	if ip.ztyp <= z6noz {
+		return ""
 	}
-	return ""
+	si, _ := zstr.Load(ip.ztyp)
+	s, _ := si.(string)
+	return s
 }
 
 // Compare returns an integer comparing two IPs.
@@ -383,27 +341,18 @@ func (ip IP) IPAddr() *net.IPAddr {
 //
 // It returns false for IP4-mapped IPv6 addresses. See IP.Unmap.
 func (ip IP) Is4() bool {
-	if ip.ipImpl == nil {
-		return false
-	}
-	return ip.ipImpl.is4()
+	return ip.zt == z4
 }
 
 // Is4in6 reports whether ip is an IPv4-mapped IPv6 address.
 func (ip IP) Is4in6() bool {
-	if ip.ipImpl == nil {
-		return false
-	}
-	return ip.ipImpl.is4in6()
+	return ip.zt == z6zoneless && string(ip.a[:len(mapped4Prefix)]) == mapped4Prefix
 }
 
 // Is6 reports whether ip is an IPv6 address, including IPv4-mapped
 // IPv6 addresses.
 func (ip IP) Is6() bool {
-	if ip.ipImpl == nil {
-		return false
-	}
-	return ip.ipImpl.is6()
+	return ip.zt.Is6()
 }
 
 // Unmap returns ip with any IPv4-mapped IPv6 address prefix removed.
@@ -412,83 +361,61 @@ func (ip IP) Is6() bool {
 // returns the wrapped IPv4 address. Otherwise it returns ip, regardless
 // of its type.
 func (ip IP) Unmap() IP {
-	if !ip.Is4in6() {
-		return ip
+	if ip.Is4in6() {
+		ip.zt = z4
 	}
-	a := ip.ipImpl.as16()
-	return IP{v4Addr{a[12], a[13], a[14], a[15]}}
+	return ip
 }
 
 // WithZone returns an IP that's the same as ip but with the provided
 // zone. If zone is empty, the zone is removed. If ip is an IPv4
 // address it's returned unchanged.
 func (ip IP) WithZone(zone string) IP {
-	if zone == "" {
-		if z, ok := ip.ipImpl.(v6AddrZone); ok {
-			return IP{z.v6Addr}
-		}
+	if !ip.Is6() {
 		return ip
 	}
-	switch ip := ip.ipImpl.(type) {
-	case v6Addr:
-		return IP{v6AddrZone{ip, zone}}
-	case v6AddrZone:
-		return IP{v6AddrZone{ip.v6Addr, zone}}
+	if zone == "" {
+		ip.zt = z6zoneless
+		return ip
 	}
+	panic("XXX TODO allocate one or get from table")
 	return ip
 }
 
 // IsLinkLocalUnicast reports whether ip is a link-local unicast address.
 // If ip is the zero value, it will return false.
 func (ip IP) IsLinkLocalUnicast() bool {
-	// See: https://en.wikipedia.org/wiki/Link-local_address.
-	switch ip := ip.ipImpl.(type) {
-	case nil:
-		return false
-	case v4Addr:
-		return ip[0] == 169 && ip[1] == 254
-	case v6Addr:
-		return ip[0] == 0xfe && ip[1] == 0x80
-	case v6AddrZone:
-		return ip.v6Addr[0] == 0xfe && ip.v6Addr[1] == 0x80
-	default:
-		panic("netaddr: unhandled ipImpl representation")
+	if ip.Is4() {
+		return ip.a[o4+0] == 169 && ip.a[o4+1] == 254
 	}
+	if ip.Is6() {
+		return ip.a[0] == 0xfe && ip.a[1] == 0x80
+	}
+	return false
 }
 
 // IsLoopback reports whether ip is a loopback address. If ip is the zero value,
 // it will return false.
 func (ip IP) IsLoopback() bool {
-	switch ip := ip.ipImpl.(type) {
-	case nil:
-		return false
-	case v4Addr:
-		return ip[0] == 127
-	case v6Addr:
-		return string(ip[:len(v6Loopback)]) == v6Loopback
-	case v6AddrZone:
-		return string(ip.v6Addr[:len(v6Loopback)]) == v6Loopback
-	default:
-		panic("netaddr: unhandled ipImpl representation")
+	if ip.Is4() {
+		return ip.a[o4+0] == 127
 	}
+	if ip.Is6() {
+		return string(ip.a) == v6Loopback
+	}
+	return false
 }
 
 // IsMulticast reports whether ip is a multicast address. If ip is the zero
 // value, it will return false.
 func (ip IP) IsMulticast() bool {
-	// See: https://en.wikipedia.org/wiki/Multicast_address.
-	switch ip := ip.ipImpl.(type) {
-	case nil:
-		return false
-	case v4Addr:
-		return ip[0]&0xf0 == 0xe0
-	case v6Addr:
-		return ip[0] == 0xff
-	case v6AddrZone:
-		return ip.v6Addr[0] == 0xff
-	default:
-		panic("netaddr: unhandled ipImpl representation")
+	if ip.Is4() {
+		return ip.a[o4+0]&0xf0 == 0xe0
 	}
+	if ip.Is6() {
+		return ip.a[0] == 0xff
+	}
+	return false
 }
 
 // Prefix applies a CIDR mask of leading bits to IP, producing an IPPrefix
@@ -496,12 +423,14 @@ func (ip IP) IsMulticast() bool {
 // a nil error are returned. If bits is larger than 32 for an IPv4 address or
 // 128 for an IPv6 address, an error is returned.
 func (ip IP) Prefix(bits uint8) (IPPrefix, error) {
-	if ip.ipImpl == nil {
+	if ip.zt == z0 {
 		return IPPrefix{}, nil
 	}
-	// TODO: optimize this to return ip directly if it's already
-	// masked and to not allocate a new IP.ipImpl.
-	return ip.prefix(bits)
+	if ip.Is4() {
+		return v4Prefix(ip.As4(), bits)
+	}
+	// TODO: preserve zone?
+	return v6Prefix(ip.addr, bits)
 }
 
 // As16 returns the IP address in its 16 byte representation.
@@ -510,25 +439,21 @@ func (ip IP) Prefix(bits uint8) (IPPrefix, error) {
 // Zone method to get it).
 // The ip zero value returns all zeroes.
 func (ip IP) As16() [16]byte {
-	if ip.ipImpl == nil {
-		return [16]byte{}
-	}
-	return ip.ipImpl.as16()
+	return ip.a
 }
 
 // As4 returns an IPv4 or IPv4-in-IPv6 address in its 4 byte representation.
 // If ip is the IP zero value or an IPv6 address, As4 panics.
 // Note that 0.0.0.0 is not the zero value.
 func (ip IP) As4() [4]byte {
-	if ip.ipImpl == nil {
+	switch ip.zt {
+	case z4:
+		return [4]byte{ip.a[o4+0], ip.a[o4+1], ip.a[o4+2], ip.a[o4+3]}
+	case z0:
 		panic("As4 called on IP zero value")
-	}
-	switch v := ip.ipImpl.(type) {
-	case v4Addr:
-		return v
-	case v6Addr:
-		if v.is4in6() {
-			return [4]byte{v[12], v[13], v[14], v[15]}
+	case z6zoneless:
+		if ip.Is4In6() {
+			return [4]byte{ip.a[o4+0], ip.a[o4+1], ip.a[o4+2], ip.a[o4+3]}
 		}
 	}
 	panic("As4 called on IPv6 address")
@@ -545,17 +470,24 @@ func (ip IP) As4() [4]byte {
 // Note that unlike the Go standard library's IP.String method,
 // IP4-mapped IPv6 addresses do not format as dotted decimals.
 func (ip IP) String() string {
-	if ip.ipImpl == nil {
+	if ip.zt == z0 {
 		return "invalid IP"
 	}
-	return ip.ipImpl.String()
+	if ip.Is4() {
+		return fmt.Sprintf("%d.%d.%d.%d", ip.a[o4+0], ip.a[o4+1], ip.a[o4+2], ip.a[o4+3])
+	}
+	if ip.Is4In6() {
+		a4 := ip.As4()
+		return fmt.Sprintf("::ff:%x%02d:%x%02x", a4[0], a4[1], a4[2], a4[3])
+	}
+	return (&net.IPAddr{IP: net.IP(ip.addr[:]), Zone: ip.Zone()}).String()
 }
 
 // MarshalText implements the encoding.TextMarshaler interface,
 // The encoding is the same as returned by String, with one exception:
 // If ip is the zero value, the encoding is the empty string.
 func (ip IP) MarshalText() ([]byte, error) {
-	if ip.ipImpl == nil {
+	if ip.zt == z0 {
 		return []byte(""), nil
 	}
 	return []byte(ip.String()), nil
@@ -565,7 +497,7 @@ func (ip IP) MarshalText() ([]byte, error) {
 // The IP address is expected in a form accepted by ParseIP.
 // It returns an error if *ip is not the IP zero value.
 func (ip *IP) UnmarshalText(text []byte) error {
-	if ip.ipImpl != nil {
+	if ip.zt != z0 {
 		return errors.New("netaddr: refusing to Unmarshal into non-zero IP")
 	}
 	if len(text) == 0 {
